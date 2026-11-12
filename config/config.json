@@ -1,5 +1,0 @@
-{
-    "API_URL" : "https://openrouter.ai/api/v1/chat/completions",
-    "API_KEY" : "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",
-    "API-MODEL" : "nvidia/nemotron-3.5-super-vl:free"
-}
