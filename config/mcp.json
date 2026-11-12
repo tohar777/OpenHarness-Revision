@@ -1,0 +1,12 @@
+{
+  "servers": {
+    "test": {
+      "transport": "stdio",
+      "command": "",
+      "args": [
+        "test.py"
+      ],
+      "env": {}
+    }
+  }
+}
