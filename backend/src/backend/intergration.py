@@ -1,6 +1,7 @@
 import json
 import requests
-
+import uuid
+import asyncio
 from pathlib import Path
 from backend.system_config import systemprompt
 from backend.filesystem import FileSystem
@@ -149,6 +150,8 @@ registry.register(
 )
 
 
+
+
 async def sendRequest(prompt: str):
     messages = [
         {
@@ -166,74 +169,194 @@ async def sendRequest(prompt: str):
         "Content-Type": "application/json"
     }
 
-    # Tool execution loop
-    max_iterations = 8
+    is_openai_compatible = "/v1/" in API_URL
+    max_iterations = 1000
 
-    for _ in range(max_iterations):
+    def extract_custom_tool_call(message):
+        """
+        Supports models that return:
+        {
+            "name": "write_file",
+            "arguments": {...}
+        }
+        inside message.content.
+        """
+        content = message.get("content")
+
+        if not isinstance(content, str):
+            return None
+
+        content = content.strip()
+
+        # Handle Markdown JSON code blocks
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1]
+            content = content.rsplit("```", 1)[0].strip()
+
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+
+        if (
+            isinstance(data, dict)
+            and isinstance(data.get("name"), str)
+            and isinstance(data.get("arguments"), dict)
+        ):
+            return {
+                "name": data["name"],
+                "arguments": data["arguments"]
+            }
+
+        return None
+
+    for iteration in range(max_iterations):
+
         payload = {
             "model": MODEL,
             "messages": messages,
             "tools": registry.get_schemas(),
-            "tool_choice": "auto"
+            "stream": False
         }
 
         try:
-            response = requests.post(
+            # Avoid blocking the async event loop
+            response = await asyncio.to_thread(
+                requests.post,
                 API_URL,
                 headers=headers,
-                json=payload,
-                timeout=120
+                json=payload
             )
 
             response.raise_for_status()
             result = response.json()
 
-            message = result["choices"][0]["message"]
+            # Extract assistant message
+            if "choices" in result:
+                message = result["choices"][0]["message"]
 
-            # No tool calls: return final response
-            tool_calls = message.get("tool_calls")
+            elif "message" in result:
+                message = result["message"]
+
+            else:
+                return f"Unexpected API response: {result}"
+
+            print(f"\n--- Iteration {iteration + 1} ---")
+            print("Assistant:", json.dumps(
+                message,
+                indent=4,
+                ensure_ascii=False
+            ))
+
+            # 1. Native tool calls
+            tool_calls = message.get("tool_calls") or []
+
+            # 2. Custom JSON tool calls inside message.content
+            custom_call = None
 
             if not tool_calls:
-                return message.get("content", "")
+                custom_call = extract_custom_tool_call(message)
 
-            # Add assistant tool-call message
-            messages.append(message)
+            # No tool calls means the model has finished
+            if not tool_calls and not custom_call:
+                return message.get("content") or ""
 
-            # Execute each requested tool
-            for tool_call in tool_calls:
-                function = tool_call["function"]
+            # Execute native tool calls
+            if tool_calls:
 
-                tool_name = function["name"]
-                arguments = json.loads(function["arguments"])
+                messages.append(message)
 
-                try:
+                for tool_call in tool_calls:
+
+                    function = tool_call["function"]
+                    tool_name = function["name"]
+                    arguments = function.get("arguments", {})
+
+                    if isinstance(arguments, str):
+                        arguments = json.loads(arguments)
+
+                    print(f"\nExecuting tool: {tool_name}")
+                    print("Arguments:", arguments)
+
                     tool_result = await registry.execute(
                         tool_name,
                         arguments
                     )
 
-                    if not isinstance(tool_result, str):
-                        tool_result = json.dumps(
-                            tool_result,
-                            ensure_ascii=False,
-                            default=str
-                        )
+                    print("Tool result:", tool_result)
 
-                except Exception as error:
-                    tool_result = json.dumps({
-                        "error": str(error)
+                    if is_openai_compatible:
+                        tool_call_id = tool_call.get("id")
+
+                        if not tool_call_id:
+                            return "Tool call is missing its ID."
+
+                        tool_message = {
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": str(tool_result)
+                        }
+
+                    else:
+                        tool_message = {
+                            "role": "tool",
+                            "content": str(tool_result)
+                        }
+
+                    messages.append(tool_message)
+
+            # Execute custom JSON tool calls
+            elif custom_call:
+
+                tool_name = custom_call["name"]
+                arguments = custom_call["arguments"]
+
+                print(f"\nExecuting custom tool: {tool_name}")
+                print("Arguments:", arguments)
+
+                tool_result = await registry.execute(
+                    tool_name,
+                    arguments
+                )
+
+                print("Tool result:", tool_result)
+
+                if is_openai_compatible:
+                    # Convert custom JSON into a native tool-call message
+                    tool_call_id = "call_" + uuid.uuid4().hex
+
+                    messages.append({
+                        "role": "assistant",
+                        "content": message.get("content", "")
                     })
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "content": tool_result
-                })
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"Tool '{tool_name}' executed successfully.\n"
+                            f"Result:\n{tool_result}\n\n"
+                            "Continue working on the original request. "
+                            "Do not repeat the tool call unless necessary."
+                        )
+                    })
+
+                else:
+                    # Native Ollama-style tool result
+                    messages.append({
+                        "role": "assistant",
+                        "content": message.get("content", "")
+                    })
+
+                    messages.append({
+                        "role": "tool",
+                        "content": str(tool_result)
+                    })
 
         except requests.exceptions.RequestException as error:
             return f"API request failed: {error}"
 
-        except (KeyError, IndexError, ValueError) as error:
-            return f"Invalid API response: {error}"
+        except Exception as error:
+            print(f"Agent error: {error}")
+            return f"Agent execution failed: {error}"
 
     return "Maximum tool execution iterations reached."

@@ -1,6 +1,7 @@
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+import requests
 from backend.intergration import sendRequest
 import asyncio
 app = Flask(__name__)
@@ -25,6 +26,27 @@ def send_request():
     except Exception:
         app.logger.exception("AI request failed")
         return jsonify({"error": "AI request failed"}), 500
+    except requests.exceptions.HTTPError as error:
+        response = error.response
 
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After", "unknown")
+
+            try:
+                details = response.json()
+            except ValueError:
+                details = response.text
+
+            return {
+                "error": "rate_limit",
+                "message": "OpenRouter rate limit reached.",
+                "retry_after": retry_after,
+                "details": details
+            }
+
+        return {
+            "error": "api_error",
+            "message": str(error)
+        }
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=True)
